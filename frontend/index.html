@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Регистрация по клавиатурному почерку</title>
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+    <div id="view-setup" class="view">
+      <div class="card card-setup">
+        <h1>Регистрация по клавиатурному почерку</h1>
+
+        <section class="block">
+          <div class="field">
+            <label for="userId">Имя или логин</label>
+            <input id="userId" type="text" autocomplete="username" />
+          </div>
+
+          <div class="field">
+            <span class="label-like">Режим ввода</span>
+            <div class="device-toggle" role="group" aria-label="Режим ввода">
+              <button type="button" data-device="desktop" class="device-btn active">Desktop</button>
+              <button type="button" data-device="mobile" class="device-btn">Mobile</button>
+            </div>
+          </div>
+
+          <p id="statusSetup" class="status" role="status"></p>
+          <button type="button" id="btnStart" class="btn-primary">Начать регистрацию</button>
+        </section>
+      </div>
+    </div>
+
+    <div id="view-typing" class="view" hidden>
+      <div class="card card-typing">
+        <button type="button" id="btnBack" class="btn-back">← К имени и режиму</button>
+
+        <section class="block">
+          <h2 class="block-title">Набор фразы</h2>
+
+          <div class="field">
+            <span class="label-like">Контрольная фраза</span>
+            <p id="prompt" class="phrase" aria-live="polite"></p>
+          </div>
+
+          <div class="field">
+            <span class="label-like">Прогресс</span>
+            <div class="bar" aria-hidden="true"><div id="progressFill"></div></div>
+            <p id="progressHint" class="progress-hint"></p>
+          </div>
+
+          <div class="field">
+            <label for="typing">Поле ввода</label>
+            <p class="hint">
+              Наберите контрольную фразу необходимое количество раз. Набирайте естественно, не копируя. Следующая попытка
+              автоматически переключится при полном совпадении текста с контрольным.
+            </p>
+            <textarea
+              id="typing"
+              autocomplete="off"
+              spellcheck="false"
+              rows="4"
+              disabled
+              aria-label="Набор контрольной фразы"
+            ></textarea>
+          </div>
+
+          <p id="status" class="status" role="status"></p>
+          <button type="button" id="btnReset" class="link" hidden>Сбросить и начать заново</button>
+        </section>
+      </div>
+    </div>
+
+    <div class="debug-wrap">
+      <details class="debug">
+        <summary>JSON (отладка)</summary>
+        <pre id="jsonPreview"></pre>
+      </details>
+    </div>
+
+    <script src="js/app.js" defer></script>
+  </body>
+</html>

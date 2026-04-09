@@ -14,12 +14,12 @@ async def lifespan(app: FastAPI):
     app.state.sessions = {}
     
     # Migration if needed
-    await dbase.migrate_models()
+    await dbase.db_instance.migrate_models()
 
     try:
         yield
     finally:
-        await dbase.async_engine.dispose()
+        await dbase.db_instance.async_engine.dispose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -34,7 +34,7 @@ app.add_middleware(
 )
 
 
-app.include_router(security.security_route)
+app.include_router(security.router)
 
 if __name__ == "__main__":
     import uvicorn

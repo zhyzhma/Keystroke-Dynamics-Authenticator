@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 # Импорты согласно структуре проекта
-from app.database.dbase import get_db, User
+from app.database.dbase import get_db, User, UserDeviceModel
 from app.feature_engineering.engineering import transform_payload
 from app.ml_model.model import KeystrokeModel, extract_training_data
 
@@ -28,14 +28,16 @@ class KeystrokeAttempt(BaseModel):
     events: List[RawEvent] = Field(..., description="Список событий нажатий")
 
 class EnrollRequest(BaseModel):
-    login: str = Field(..., description="Логин пользователя")
-    phrase: str = Field(..., description="Фраза, которую вводил пользователь")
-    attempts: List[KeystrokeAttempt] = Field(..., description="Список из 30-40 попыток для обучения")
+    login: str
+    phrase: str
+    device_type: str = Field("desktop", description="Тип устройства: desktop или mobile")
+    attempts: List[KeystrokeAttempt]
 
 class VerifyRequest(BaseModel):
-    login: str = Field(..., description="Логин пользователя")
-    phrase: str = Field(..., description="Введенная фраза")
-    attempt: KeystrokeAttempt = Field(..., description="Текущая попытка ввода для проверки")
+    login: str
+    phrase: str
+    device_type: str = "desktop"
+    attempt: KeystrokeAttempt
 
 # --- Выходные Pydantic модели (с описанием) ---
 
@@ -67,10 +69,10 @@ async def enroll_user(
     processed_data = transform_payload(raw_data)
     vectors, names = extract_training_data(processed_data)
     
-    if len(vectors) < 5:
+    if len(vectors) < 10:
         raise HTTPException(
             status_code=400, 
-            detail="Недостаточно попыток для обучения. Нужно минимум 5 (рекомендуется 30+)."
+            detail="Недостаточно попыток для обучения. Нужно минимум 10 (рекомендуется 30+)."
         )
 
     # Обучение
@@ -105,7 +107,7 @@ async def verify_user(
     Верификация пользователя по одной попытке ввода.
     Сравнивает текущий ритм с 'эталоном', хранящимся в БД.
     """
-    result = await db.execute(select(User).filter_by(login=payload.login))
+    result = await db.execute(select(UserDeviceModel).filter_by(login=payload.login, device_type=payload.device_type))
     user = result.scalar_one_or_none()
 
     if not user:

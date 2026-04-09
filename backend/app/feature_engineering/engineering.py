@@ -113,6 +113,7 @@ class AttemptExtractor:
         self.global_dwell = []
         self.printable_records = []
         self.digraphs = defaultdict(lambda: defaultdict(list))
+        self.trigraphs = defaultdict(lambda: defaultdict(list))
         self.total_keydowns = 0
         self.backspace_count = 0
         self.current_text = ""
@@ -176,7 +177,15 @@ class AttemptExtractor:
             a, b = seq[i], seq[i + 1]
             k2 = make_ngram_key([a["symbol"], b["symbol"]])
             self.digraphs[k2]["flight"].append(b["down_t"] - a["up_t"])
-
+        
+        # Расчет триграфов (интервалы для 3-х клавиш)
+        for i in range(len(seq) - 2):
+            a, b, c = seq[i], seq[i + 1], seq[i + 2]
+            k3 = make_ngram_key([a["symbol"], b["symbol"], c["symbol"]])
+            # Интервал от отпускания первой до нажатия третьей (один из вариантов признака)
+            self.trigraphs[k3]["total_time"].append(c["down_t"] - a["up_t"])
+        
+        
         char_count = len(self.current_text) if self.current_text else len(target_text)
         typing_speed_cpm = (char_count / duration_ms * 60000.0) if duration_ms > 0 else 0.0
 
@@ -197,6 +206,10 @@ class AttemptExtractor:
         # Добавляем dwell-time для каждой физической клавиши (в нижнем регистре)
         for code, values in self.dwell_by_code.items():
             attempt_features[f"key_{code}"] = safe_mean_std(values)
+
+        for code, values in self.trigraphs.items():
+            attempt_features[f"trigraph_{code}"] = safe_mean_std(values["flight_total"])
+
 
         flat = flatten_numeric(attempt_features)
         

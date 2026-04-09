@@ -1,7 +1,7 @@
 import pickle
 from typing import Optional, AsyncGenerator
 
-from sqlalchemy import Column, Integer, String, LargeBinary
+from sqlalchemy import Column, Integer, String, LargeBinary, UniqueConstraint
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -74,6 +74,24 @@ class DatabaseUrlBuilder():
 class Base(DeclarativeBase):
     pass
 
+class UserDeviceModel(Base):
+    """Таблица для хранения моделей пользователей с привязкой к типу устройства"""
+    __tablename__ = "user_keystroke_models"
+
+    id = Column(Integer, primary_key=True)
+    login = Column(String, index=True, nullable=False)
+    device_type = Column(String, default="desktop") # desktop / mobile
+    model_blob = Column(LargeBinary, nullable=False)
+
+    # Гарантируем, что для пары (логин + устройство) только одна запись
+    __table_args__ = (UniqueConstraint('login', 'device_type', name='_login_device_uc'),)
+
+    def set_model(self, model_obj):
+        self.model_blob = pickle.dumps(model_obj)
+
+    def get_model(self):
+        return pickle.loads(self.model_blob) if self.model_blob else None
+
 class User(Base):
     """
     Единственная таблица для хранения пользователей и их обученных моделей.
@@ -94,6 +112,7 @@ class User(Base):
         if self.model_data:
             return pickle.loads(self.model_data)
         return None
+    
 
 class Database():
     def __init__(self, url: Optional[str] = None):

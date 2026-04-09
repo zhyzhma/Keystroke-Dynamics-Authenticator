@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:15
+    container_name: photoguesser_db
+    restart: on-failure #??
+    env_file: .env
+
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME}
+      POSTGRES_USER: ${DATABASE_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER} -d ${DATABASE_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./backend
+    env_file: .env
+
+    container_name: photoguesser_api 
+    restart: on-failure # ?
+
+    working_dir: /app 
+    
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 # --reload ??
+    volumes:
+      - ./backend:/app
+      - ./source:/source
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

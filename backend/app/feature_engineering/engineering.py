@@ -5,117 +5,149 @@ from collections import defaultdict
 from statistics import mean, median, pstdev
 from typing import Any, Dict, List, Optional
 
-# Импортируем обновленный класс и вспомогательные функции
 from app.ml_model.model import KeystrokeModel, extract_training_data
 
 NG_SEP = "␟"
 
-def authenticate_user(parsed_json: Dict[str, Any], model_path: str) -> Dict[str, Any]:
-    """
-    Проводит аутентификацию, используя словарь признаков.
-    """
-    model = KeystrokeModel()
-    model.load(model_path)
 
-    if not parsed_json.get("attempts"):
-        return {"accepted": False, "error": "No attempts found"}
-    
-    # Берем признаки из первой попытки для верификации
-    first_attempt_features = parsed_json["attempts"][0]["features"]["flat_features"]
-    
-    # Модель сама сопоставит ключи (уже приведенные к нижнему регистру)
-    result = model.predict(first_attempt_features)
-
-    return {
-        "accepted": result["accepted"],
-        "score": result["score"],
-        "threshold": result["threshold"],
-        "confidence": result.get("confidence", 0.0)
-    }
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def safe_mean_std(values: List[float]) -> Dict[str, float]:
     if not values:
         return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "median": 0.0, "count": 0}
-    
     if len(values) == 1:
         v = float(values[0])
         return {"mean": v, "std": 0.0, "min": v, "max": v, "median": v, "count": 1}
-    
     vals = [float(v) for v in values]
     return {
-        "mean": float(mean(vals)),
-        "std": float(pstdev(vals)),
-        "min": float(min(vals)),
-        "max": float(max(vals)),
+        "mean":   float(mean(vals)),
+        "std":    float(pstdev(vals)),
+        "min":    float(min(vals)),
+        "max":    float(max(vals)),
         "median": float(median(vals)),
-        "count": len(vals),
+        "count":  len(vals),
     }
 
+
 def normalize_string(s: Any) -> str:
-    """Приводит строку к нижнему регистру и удаляет лишние пробелы."""
     if s is None:
         return ""
     return str(s).strip().lower()
 
+
 def normalize_code(code: Optional[str], key: Optional[str]) -> str:
-    """Нормализует код клавиши к нижнему регистру."""
     if code:
         return normalize_string(code)
-    
     if key == " ":
         return "space"
-    
     if key:
         return normalize_string(key)
-    
     return "unknown"
 
+
 def printable_symbol_from_event(ev: Dict[str, Any]) -> Optional[str]:
-    """Извлекает символ, приводя его к нижнему регистру для единообразия."""
-    # Обрабатываем возможные варианты написания ключей в JSON
-    key = ev.get("key") or ev.get("Key")
+    key  = ev.get("key")  or ev.get("Key")
     code = ev.get("code") or ev.get("Code")
-    
-    #norm_key = normalize_string(key)
     norm_code = normalize_code(code, key)
-    
     if norm_code == "space" or key == " ":
         return " "
-    
     if isinstance(key, str) and len(key) == 1:
         return key.lower()
-    
     return None
+
 
 def make_ngram_key(tokens: List[str]) -> str:
     return NG_SEP.join(tokens)
+
 
 def flatten_numeric(d: Any, prefix: str = "") -> Dict[str, float]:
     out: Dict[str, float] = {}
     if isinstance(d, dict):
         for k, v in d.items():
-            # Ключи признаков тоже приводим к нижнему регистру
             clean_k = k.lower()
-            key = f"{prefix}{clean_k}" if not prefix else f"{prefix}.{clean_k}"
-            
+            key = clean_k if not prefix else f"{prefix}.{clean_k}"
             if isinstance(v, dict):
                 out.update(flatten_numeric(v, key))
-            elif isinstance(v, (int, float, bool)) and not isinstance(v, str):
+            elif isinstance(v, bool):
+                out[key] = 1.0 if v else 0.0
+            elif isinstance(v, (int, float)):
                 out[key] = float(v)
     return out
 
+
+# ---------------------------------------------------------------------------
+# Core extractor
+# ---------------------------------------------------------------------------
+
 class AttemptExtractor:
+    """
+    Extracts the full set of keystroke-dynamics features required by the spec:
+
+    Global timing
+      - dwell (hold) time          – keydown → keyup per key
+      - flight time                – keyup[i] → keydown[i+1]
+      - down-down time             – keydown[i] → keydown[i+1]
+      - up-up time                 – keyup[i]   → keyup[i+1]
+
+    Per-key
+      - dwell stats for each physical key code
+
+    N-grams (per pair/triple of *printable* characters)
+      - digraph : flight, down-down, up-up + frequency count
+      - trigraph: span (keyup[0] → keydown[2]) + frequency count
+
+    Errors
+      - backspace count
+      - delete count
+      - paste detected flag
+
+    Modifiers
+      - left-shift usage count
+      - right-shift usage count
+      - capslock toggle count
+      - capitals-via-shift count
+      - capitals-via-capslock count
+
+    Speed
+      - typing speed in CPM
+    """
+
     def __init__(self) -> None:
-        self.pending_down = defaultdict(list)
-        # Названия модификаторов в нижнем регистре
-        self.active_mods = {"shiftleft": False, "shiftright": False, "capslock": False}
-        self.dwell_by_code = defaultdict(list)
-        self.global_dwell = []
-        self.printable_records = []
-        self.digraphs = defaultdict(lambda: defaultdict(list))
-        self.trigraphs = defaultdict(lambda: defaultdict(list))
-        self.total_keydowns = 0
+        self.pending_down: Dict[str, List[float]] = defaultdict(list)
+
+        self.shift_left_active  = False
+        self.shift_right_active = False
+        self.capslock_on        = False
+
+        self.dwell_by_code: Dict[str, List[float]] = defaultdict(list)
+
+        self.global_dwell:     List[float] = []
+        self.global_flight:    List[float] = []
+        self.global_down_down: List[float] = []
+        self.global_up_up:     List[float] = []
+
+        self.printable_records: List[Dict[str, Any]] = []
+
+        self.digraph_flight:    Dict[str, List[float]] = defaultdict(list)
+        self.digraph_down_down: Dict[str, List[float]] = defaultdict(list)
+        self.digraph_up_up:     Dict[str, List[float]] = defaultdict(list)
+        self.trigraph_span:     Dict[str, List[float]] = defaultdict(list)
+
         self.backspace_count = 0
+        self.delete_count    = 0
+        self.paste_detected  = False
+
+        self.left_shift_count      = 0
+        self.right_shift_count     = 0
+        self.capslock_toggle_count = 0
+        self.capitals_via_shift    = 0
+        self.capitals_via_capslock = 0
+
+        self.last_keydown_t: Optional[float] = None
+        self.last_keyup_t:   Optional[float] = None
+
         self.current_text = ""
 
     def process(self, events: List[Dict[str, Any]], target_text: str = "") -> Dict[str, Any]:
@@ -123,141 +155,230 @@ class AttemptExtractor:
             return {"flat_features": {}, "feature_names": [], "feature_vector": []}
 
         events = sorted(events, key=lambda e: float(e.get("t", 0.0)))
-        start_t = float(events[0].get("t", 0.0))
-        end_t = float(events[-1].get("t", 0.0))
+        start_t     = float(events[0].get("t", 0.0))
+        end_t       = float(events[-1].get("t", 0.0))
         duration_ms = max(1.0, end_t - start_t)
 
+        # ── pass 1: raw event loop ────────────────────────────────────────
         for ev in events:
-            # Гибкий поиск типа события
-            etype = normalize_string(ev.get("type") or ev.get("eventType") or ev.get("eventtype"))
-            t = float(ev.get("t", 0.0))
-            key = ev.get("key")
+            etype = normalize_string(
+                ev.get("type") or ev.get("eventType") or ev.get("eventtype")
+            )
+            t    = float(ev.get("t", 0.0))
+            key  = ev.get("key")
             code = normalize_code(ev.get("code"), key)
-            
+
+            if etype == "paste":
+                self.paste_detected = True
+                continue
+
+            if etype == "input":
+                val = ev.get("value", "")
+                self.current_text = str(val) if val is not None else self.current_text
+                continue
+
             if etype == "keydown":
-                self.total_keydowns += 1
-                if normalize_string(key) == "backspace":
+                norm_key = normalize_string(key)
+
+                if norm_key == "backspace":
                     self.backspace_count += 1
-                
-                if code in self.active_mods:
-                    if code == "capslock":
-                        self.active_mods[code] = not self.active_mods[code]
-                    else:
-                        self.active_mods[code] = True
-                
+                elif norm_key == "delete":
+                    self.delete_count += 1
+
+                if code == "shiftleft":
+                    self.shift_left_active = True
+                    self.left_shift_count += 1
+                elif code == "shiftright":
+                    self.shift_right_active = True
+                    self.right_shift_count += 1
+                elif code == "capslock":
+                    self.capslock_on = not self.capslock_on
+                    self.capslock_toggle_count += 1
+
                 sym = printable_symbol_from_event(ev)
-                # Игнорируем повторы при зажатии (key repeat) для чистоты таймингов
+                if sym and sym != " " and sym.isupper():
+                    if self.shift_left_active or self.shift_right_active:
+                        self.capitals_via_shift += 1
+                    elif self.capslock_on:
+                        self.capitals_via_capslock += 1
+
+                if self.last_keydown_t is not None:
+                    self.global_down_down.append(t - self.last_keydown_t)
+                self.last_keydown_t = t
+
                 is_repeat = ev.get("repeat") is True or ev.get("Repeat") is True
                 if sym and not is_repeat:
-                    self.printable_records.append({"symbol": sym, "code": code, "down_t": t, "up_t": None})
-                
+                    self.printable_records.append({
+                        "symbol": sym,
+                        "code":   code,
+                        "down_t": t,
+                        "up_t":   None,
+                    })
+
                 self.pending_down[code].append(t)
 
             elif etype == "keyup":
-                if code == "shiftleft" or code == "shiftright":
-                    self.active_mods[code] = False
-                
+                if code == "shiftleft":
+                    self.shift_left_active = False
+                elif code == "shiftright":
+                    self.shift_right_active = False
+
                 if self.pending_down[code]:
                     dwell = t - self.pending_down[code].pop()
                     self.dwell_by_code[code].append(dwell)
                     self.global_dwell.append(dwell)
-                
+
+                if self.last_keyup_t is not None:
+                    self.global_up_up.append(t - self.last_keyup_t)
+                self.last_keyup_t = t
+
                 for rec in reversed(self.printable_records):
                     if rec["code"] == code and rec["up_t"] is None:
                         rec["up_t"] = t
                         break
-            
-            elif etype == "input":
-                val = ev.get("value", "")
-                self.current_text = str(val)
 
-        # Расчет интервалов между клавишами (диграфы)
+        # ── pass 2: n-gram intervals ──────────────────────────────────────
         seq = [r for r in self.printable_records if r["up_t"] is not None]
+
         for i in range(len(seq) - 1):
             a, b = seq[i], seq[i + 1]
-            k2 = make_ngram_key([a["symbol"], b["symbol"]])
-            self.digraphs[k2]["flight"].append(b["down_t"] - a["up_t"])
-        
-        # Расчет триграфов (интервалы для 3-х клавиш)
+            k2   = make_ngram_key([a["symbol"], b["symbol"]])
+
+            flight    = b["down_t"] - a["up_t"]
+            down_down = b["down_t"] - a["down_t"]
+            up_up     = b["up_t"]   - a["up_t"]
+
+            self.digraph_flight[k2].append(flight)
+            self.digraph_down_down[k2].append(down_down)
+            self.digraph_up_up[k2].append(up_up)
+            self.global_flight.append(flight)
+
         for i in range(len(seq) - 2):
             a, b, c = seq[i], seq[i + 1], seq[i + 2]
             k3 = make_ngram_key([a["symbol"], b["symbol"], c["symbol"]])
-            # Интервал от отпускания первой до нажатия третьей (один из вариантов признака)
-            self.trigraphs[k3]["total_time"].append(c["down_t"] - a["up_t"])
-        
-        
-        char_count = len(self.current_text) if self.current_text else len(target_text)
-        typing_speed_cpm = (char_count / duration_ms * 60000.0) if duration_ms > 0 else 0.0
+            self.trigraph_span[k3].append(c["down_t"] - a["up_t"])
 
-        attempt_features = {
+        # ── assemble feature dict ─────────────────────────────────────────
+        char_count       = len(self.current_text) if self.current_text else len(target_text)
+        typing_speed_cpm = (char_count / duration_ms * 60_000.0) if duration_ms > 0 else 0.0
+
+        attempt_features: Dict[str, Any] = {
             "meta": {
-                "duration_ms": duration_ms, 
-                "typing_speed_cpm": typing_speed_cpm
+                "duration_ms":      duration_ms,
+                "typing_speed_cpm": typing_speed_cpm,
             },
             "timings": {
-                "dwell": safe_mean_std(self.global_dwell),
-                "flight": safe_mean_std([d for g in self.digraphs.values() for d in g["flight"]])
+                "dwell":     safe_mean_std(self.global_dwell),
+                "flight":    safe_mean_std(self.global_flight),
+                "down_down": safe_mean_std(self.global_down_down),
+                "up_up":     safe_mean_std(self.global_up_up),
             },
             "errors": {
-                "backspace_count": self.backspace_count
-            }
+                "backspace_count": float(self.backspace_count),
+                "delete_count":    float(self.delete_count),
+                "paste_detected":  1.0 if self.paste_detected else 0.0,
+            },
+            "modifiers": {
+                "left_shift_count":      float(self.left_shift_count),
+                "right_shift_count":     float(self.right_shift_count),
+                "capslock_toggle_count": float(self.capslock_toggle_count),
+                "capitals_via_shift":    float(self.capitals_via_shift),
+                "capitals_via_capslock": float(self.capitals_via_capslock),
+            },
         }
 
-        # Добавляем dwell-time для каждой физической клавиши (в нижнем регистре)
+        # per-key dwell
         for code, values in self.dwell_by_code.items():
             attempt_features[f"key_{code}"] = safe_mean_std(values)
 
-        for code, values in self.trigraphs.items():
-            attempt_features[f"trigraph_{code}"] = safe_mean_std(values["flight_total"])
+        # per-digraph: flight + down-down + up-up + frequency
+        for k2 in set(self.digraph_flight) | set(self.digraph_down_down) | set(self.digraph_up_up):
+            fl  = self.digraph_flight.get(k2, [])
+            dd  = self.digraph_down_down.get(k2, [])
+            uu  = self.digraph_up_up.get(k2, [])
+            attempt_features[f"digraph_{k2}"] = {
+                "flight":    safe_mean_std(fl),
+                "down_down": safe_mean_std(dd),
+                "up_up":     safe_mean_std(uu),
+                "frequency": float(max(len(fl), len(dd), len(uu))),
+            }
 
+        # per-trigraph: span + frequency
+        for k3, spans in self.trigraph_span.items():
+            attempt_features[f"trigraph_{k3}"] = {
+                "span":      safe_mean_std(spans),
+                "frequency": float(len(spans)),
+            }
 
+        # ── flatten & normalise ───────────────────────────────────────────
         flat = flatten_numeric(attempt_features)
-        
-        # Нормализация относительно средней скорости нажатия
-        avg_dwell = attempt_features["timings"]["dwell"]["mean"]
-        if not avg_dwell:
-            avg_dwell = 1.0
-            
-        normalized_flat = {}
-        for k, v in flat.items():
-            # Если в названии признака есть намек на время, нормируем его
-            if "ms" in k or "dwell" in k or "flight" in k:
-                normalized_flat[k] = v / avg_dwell
-            else:
-                normalized_flat[k] = v
 
-        return {
-            "flat_features": normalized_flat,
-            "feature_names": sorted(normalized_flat.keys()),
-            "feature_vector": [normalized_flat[k] for k in sorted(normalized_flat.keys())]
+        avg_dwell = attempt_features["timings"]["dwell"]["mean"] or 1.0
+        TIME_KEYS = ("ms", "dwell", "flight", "down_down", "up_up", "span")
+
+        normalized_flat = {
+            k: (v / avg_dwell if any(tk in k for tk in TIME_KEYS) else v)
+            for k, v in flat.items()
         }
 
+        feature_names  = sorted(normalized_flat.keys())
+        feature_vector = [normalized_flat[k] for k in feature_names]
+
+        return {
+            "flat_features":  normalized_flat,
+            "feature_names":  feature_names,
+            "feature_vector": feature_vector,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def transform_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    attempts = payload.get("attempts", [])
     out_attempts = []
-    
-    for idx, attempt in enumerate(attempts):
+    phrase = payload.get("phrase", "")
+
+    for idx, attempt in enumerate(payload.get("attempts", [])):
         extractor = AttemptExtractor()
-        events = attempt.get("events", [])
-        phrase = payload.get("phrase", "")
-        
-        feats = extractor.process(events, target_text=phrase)
-        
+        feats = extractor.process(attempt.get("events", []), target_text=phrase)
         out_attempts.append({
             "attemptId": attempt.get("attemptId", f"att_{idx}"),
-            "features": feats
+            "features":  feats,
         })
-        
+
     return {
-        "userId": payload.get("userId"),
-        "phrase": payload.get("phrase"),
-        "attempts": out_attempts
+        "userId":   payload.get("userId"),
+        "phrase":   phrase,
+        "attempts": out_attempts,
     }
+
+
+def authenticate_user(parsed_json: Dict[str, Any], model_path: str) -> Dict[str, Any]:
+    model = KeystrokeModel.load(model_path)
+
+    if not parsed_json.get("attempts"):
+        return {"accepted": False, "error": "No attempts found"}
+
+    features = parsed_json["attempts"][0]["features"]["flat_features"]
+    result   = model.predict(features)
+
+    return {
+        "accepted":   result["accepted"],
+        "score":      result["score"],
+        "threshold":  result["threshold"],
+        "confidence": result.get("confidence", 0.0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input", nargs="?")
-    ap.add_argument("--mode", choices=["train", "verify"], default="train")
+    ap.add_argument("--mode",  choices=["train", "verify"], default="train")
     ap.add_argument("--model", default="keystroke_model.pkl")
     args = ap.parse_args()
 
@@ -274,7 +395,6 @@ def main():
         if not vectors:
             print("Error: No training data extracted")
             return
-            
         model = KeystrokeModel()
         model.fit(vectors, names)
         model.save(args.model)
@@ -282,6 +402,7 @@ def main():
     else:
         result = authenticate_user(processed_data, args.model)
         print(json.dumps(result, indent=2))
+
 
 if __name__ == "__main__":
     main()

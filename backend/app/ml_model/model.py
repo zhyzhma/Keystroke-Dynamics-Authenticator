@@ -9,7 +9,7 @@ class KeystrokeModel:
         self.nu = nu
         self.gamma = gamma
         self.scaler = StandardScaler()
-        self.model = OneClassSVM(nu=self.nu, gamma=self.gamma)
+        self.model = OneClassSVM(nu=self.nu, kernel="linear")
         
         self.is_trained = False
         self.threshold = None

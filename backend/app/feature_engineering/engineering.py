@@ -48,13 +48,21 @@ def normalize_code(code: Optional[str], key: Optional[str]) -> str:
 
 
 def printable_symbol_from_event(ev: Dict[str, Any]) -> Optional[str]:
+    """
+    Returns the printable character for this event (lowercased for n-gram keys),
+    or None if the key is non-printable.
+
+    NOTE: the *raw* key value (before lowercasing) is used for the isupper()
+    check in the modifier-tracking section of process(), so this function must
+    NOT be used there — use ev.get('key') directly for that check.
+    """
     key  = ev.get("key")  or ev.get("Key")
     code = ev.get("code") or ev.get("Code")
     norm_code = normalize_code(code, key)
     if norm_code == "space" or key == " ":
         return " "
     if isinstance(key, str) and len(key) == 1:
-        return key.lower()
+        return key.lower()   # lowercase for consistent n-gram keys
     return None
 
 
@@ -195,8 +203,11 @@ class AttemptExtractor:
                     self.capslock_on = not self.capslock_on
                     self.capslock_toggle_count += 1
 
-                sym = printable_symbol_from_event(ev)
-                if sym and sym != " " and sym.isupper():
+                # BUG FIX: check raw key (not the lowercased sym) for isupper().
+                # printable_symbol_from_event always returns lowercase, so
+                # sym.isupper() was always False and capitals were never counted.
+                raw_key = ev.get("key") or ev.get("Key") or ""
+                if isinstance(raw_key, str) and len(raw_key) == 1 and raw_key.isupper() and raw_key != " ":
                     if self.shift_left_active or self.shift_right_active:
                         self.capitals_via_shift += 1
                     elif self.capslock_on:
@@ -207,6 +218,7 @@ class AttemptExtractor:
                 self.last_keydown_t = t
 
                 is_repeat = ev.get("repeat") is True or ev.get("Repeat") is True
+                sym = printable_symbol_from_event(ev)
                 if sym and not is_repeat:
                     self.printable_records.append({
                         "symbol": sym,
@@ -287,9 +299,12 @@ class AttemptExtractor:
             },
         }
 
-        # per-key dwell
+        # BUG FIX: prefix per-key dwell as "dwell_key_" so the normalisation
+        # pass (which checks for "dwell" in key name) correctly normalises them.
+        # Previously the prefix was "key_" which was not caught by the TIME_KEYS
+        # check, leaving raw millisecond values in the feature vector.
         for code, values in self.dwell_by_code.items():
-            attempt_features[f"key_{code}"] = safe_mean_std(values)
+            attempt_features[f"dwell_key_{code}"] = safe_mean_std(values)
 
         # per-digraph: flight + down-down + up-up + frequency
         for k2 in set(self.digraph_flight) | set(self.digraph_down_down) | set(self.digraph_up_up):
@@ -310,11 +325,13 @@ class AttemptExtractor:
                 "frequency": float(len(spans)),
             }
 
-        # ── flatten & normalise ───────────────────────────────────────────
+        # ── flatten & normalise by avg_dwell (per spec §1) ────────────────
         flat = flatten_numeric(attempt_features)
 
         avg_dwell = attempt_features["timings"]["dwell"]["mean"] or 1.0
-        TIME_KEYS = ("ms", "dwell", "flight", "down_down", "up_up", "span")
+        # All keys whose values are time-domain (milliseconds) get divided by
+        # avg_dwell to make them session-speed-invariant.
+        TIME_KEYS = ("duration_ms", "dwell", "flight", "down_down", "up_up", "span")
 
         normalized_flat = {
             k: (v / avg_dwell if any(tk in k for tk in TIME_KEYS) else v)

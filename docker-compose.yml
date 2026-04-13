@@ -26,7 +26,7 @@ services:
     build: ./backend
     env_file: .env
 
-    container_name: photoguesser_api 
+    container_name: kda_api 
     restart: on-failure # ?
 
     working_dir: /app 

@@ -176,19 +176,27 @@ class KeystrokeModel:
 def extract_training_data(parsed_json: Dict[str, Any]):
     """
     Extract (vectors, feature_names) from the output of transform_payload().
-    Skips attempts with empty feature vectors.
+
+    Different attempts may produce different n-gram features (digraphs / trigraphs
+    depend on the exact keys pressed, including typos and corrections).  Collecting
+    feature_vector from the first attempt and reusing its feature_names for all
+    others results in vectors of different lengths → inhomogeneous numpy array.
+
+    Fix: collect flat_features dicts from every attempt, compute the *union* of all
+    feature names, then rebuild each vector by looking up names in the dict (missing
+    features → 0.0).  The resulting matrix is always rectangular.
     """
-    vectors:       List[List[float]]    = []
-    feature_names: Optional[List[str]] = None
+    flat_list: List[Dict[str, float]] = []
 
     for attempt in parsed_json.get("attempts", []):
-        node   = attempt.get("features", {})
-        vector = node.get("feature_vector")
-        names  = node.get("feature_names")
+        flat = attempt.get("features", {}).get("flat_features")
+        if flat:
+            flat_list.append(flat)
 
-        if vector and names:
-            vectors.append(vector)
-            if feature_names is None:
-                feature_names = names
+    if not flat_list:
+        return [], None
 
-    return vectors, feature_names
+    all_names = sorted(set().union(*(f.keys() for f in flat_list)))
+    vectors   = [[f.get(name, 0.0) for name in all_names] for f in flat_list]
+
+    return vectors, all_names

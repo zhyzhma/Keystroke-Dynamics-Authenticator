@@ -13,14 +13,23 @@ router = APIRouter(prefix="/security", tags=["security"])
 # --- Входные Pydantic модели ---
 
 class RawEvent(BaseModel):
+    """
+    Одно событие клавиатуры/ввода из фронтенда.
+
+    Поля key и code обязательны только для keydown/keyup; остальные типы событий
+    (focus, blur, paste, input, beforeinput, compositionstart/update/end) их не имеют.
+    Дополнительные поля (value, caretStart, caretEnd, inputType, data, location и др.)
+    принимаются и передаются дальше в feature engineering через extra='allow'.
+    """
     eventType: Optional[str] = Field(None, alias="type")
-    key: str
-    code: str
+    key: Optional[str] = None
+    code: Optional[str] = None
     t: float
     repeat: Optional[bool] = False
 
     class Config:
         populate_by_name = True
+        extra = "allow"
 
 class KeystrokeAttempt(BaseModel):
     attemptId: Optional[str] = "unnamed_attempt"

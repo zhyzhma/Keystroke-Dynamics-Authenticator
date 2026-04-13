@@ -3,13 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Регистрация по клавиатурному почерку</title>
+    <title>Аутентификатор по клавиатурному почерку</title>
     <link rel="stylesheet" href="css/style.css" />
   </head>
   <body>
+    <!-- Экран выбора режима и ввода логина -->
     <div id="view-setup" class="view">
       <div class="card card-setup">
-        <h1>Регистрация по клавиатурному почерку</h1>
+        <h1>Аутентификатор по клавиатурному почерку</h1>
+
+        <div class="mode-tabs" role="tablist" aria-label="Режим работы">
+          <button type="button" class="mode-tab active" data-mode="enroll"
+                  role="tab" aria-selected="true">Регистрация</button>
+          <button type="button" class="mode-tab" data-mode="verify"
+                  role="tab" aria-selected="false">Верификация</button>
+        </div>
 
         <section class="block">
           <div class="field">
@@ -31,19 +39,20 @@
       </div>
     </div>
 
+    <!-- Экран набора фразы (используется и для регистрации, и для верификации) -->
     <div id="view-typing" class="view" hidden>
       <div class="card card-typing">
         <button type="button" id="btnBack" class="btn-back">← К имени и режиму</button>
 
         <section class="block">
-          <h2 class="block-title">Набор фразы</h2>
+          <h2 class="block-title" id="typingTitle">Набор фразы</h2>
 
           <div class="field">
             <span class="label-like">Контрольная фраза</span>
             <p id="prompt" class="phrase" aria-live="polite"></p>
           </div>
 
-          <div class="field">
+          <div class="field" id="progressField">
             <span class="label-like">Прогресс</span>
             <div class="bar" aria-hidden="true"><div id="progressFill"></div></div>
             <p id="progressHint" class="progress-hint"></p>
@@ -51,9 +60,10 @@
 
           <div class="field">
             <label for="typing">Поле ввода</label>
-            <p class="hint">
-              Наберите контрольную фразу необходимое количество раз. Набирайте естественно, не копируя. Следующая попытка
-              автоматически переключится при полном совпадении текста с контрольным.
+            <p class="hint" id="typingHint">
+              Наберите контрольную фразу необходимое количество раз. Набирайте
+              естественно, не копируя. Следующая попытка автоматически переключится
+              при полном совпадении текста с контрольным.
             </p>
             <textarea
               id="typing"
@@ -68,6 +78,19 @@
           <p id="status" class="status" role="status"></p>
           <button type="button" id="btnReset" class="link" hidden>Сбросить и начать заново</button>
         </section>
+      </div>
+    </div>
+
+    <!-- Экран результата верификации -->
+    <div id="view-result" class="view" hidden>
+      <div class="card card-setup">
+        <h1>Результат верификации</h1>
+        <div id="resultBadge" class="result-badge"></div>
+        <p id="resultMessage" class="result-message"></p>
+        <div id="resultDetails" class="result-details"></div>
+        <button type="button" id="btnResultBack" class="btn-primary" style="margin-top:1.5rem">
+          Назад
+        </button>
       </div>
     </div>
 

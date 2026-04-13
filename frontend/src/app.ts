@@ -1,34 +1,46 @@
 /**
- * KDA enrollment: сбор событий клавиатуры и сборка JSON для бэкенда.
- *
- * В интерфейсе: имя пользователя и Desktop/Mobile.
- * Здесь (для разработчика): фраза, число попыток, дефолтный placeholder имени, URL API.
+ * KDA: сбор событий клавиатуры для регистрации и верификации по почерку.
  */
 
 type DevicePreset = "desktop" | "mobile";
+type AppMode = "enroll" | "verify";
 
 const CONFIG = {
-  /** Подсказка в поле «Имя», если оно пустое. */
   userIdPlaceholder: "local-user",
   targetPhrase: "The quick brown fox jumps over the lazy dog",
-  requiredAttempts: 35,
+  requiredAttempts: 30,
   defaultDevicePreset: "desktop" as DevicePreset,
   /**
-   * После сбора всех попыток отправить POST с JSON на бэкенд.
-   * Пример: "http://localhost:8080" или "https://api.example.com"
+   * URL бэкенда. Пример: "http://localhost:8000"
    * Пустая строка — не отправлять, только превью в <details>.
    */
-  apiBaseUrl: "",
-  /** Путь относительно apiBaseUrl, без хвостового слэша у base. */
-  enrollmentPath: "/api/enroll",
+  apiBaseUrl: "http://localhost:8000",
+  enrollmentPath: "/security/enroll",
+  verifyPath: "/security/verify",
 };
 
-interface EnrollmentPayload {
-  userId: string;
-  devicePreset: DevicePreset;
-  phrase: string;
-  attempts: AttemptRecord[];
+// ─── Интерфейсы payload для бекенда ───────────────────────────────────────────
+
+interface BackendAttempt {
+  attemptId: string;
+  events: CapturedEvent[];
 }
+
+interface EnrollPayload {
+  login: string;
+  device_type: DevicePreset;
+  phrase: string;
+  attempts: BackendAttempt[];
+}
+
+interface VerifyPayload {
+  login: string;
+  device_type: DevicePreset;
+  phrase: string;
+  attempt: BackendAttempt;
+}
+
+// ─── Внутренние интерфейсы ─────────────────────────────────────────────────────
 
 interface AttemptRecord {
   attemptId: string;
@@ -77,6 +89,8 @@ type CapturedEvent =
   | { type: "compositionupdate"; t: number; data: string }
   | { type: "compositionend"; t: number; data: string };
 
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
   if (!el) throw new Error(`Missing #${id}`);
@@ -98,6 +112,8 @@ function caretSnapshot(el: HTMLTextAreaElement): {
 function nowMs(): number {
   return performance.now();
 }
+
+// ─── AttemptCapture ────────────────────────────────────────────────────────────
 
 class AttemptCapture {
   private enrollmentT0: number;
@@ -142,6 +158,9 @@ class AttemptCapture {
   }
 }
 
+// ─── State ─────────────────────────────────────────────────────────────────────
+
+let appMode: AppMode = "enroll";
 let enrollmentT0 = 0;
 let sessionActive = false;
 let attempts: AttemptRecord[] = [];
@@ -150,8 +169,11 @@ let targetPhrase = CONFIG.targetPhrase;
 let requiredCount = CONFIG.requiredAttempts;
 let devicePreset: DevicePreset = CONFIG.defaultDevicePreset;
 
+// ─── DOM refs ──────────────────────────────────────────────────────────────────
+
 const viewSetup = $("view-setup") as HTMLElement;
 const viewTyping = $("view-typing") as HTMLElement;
+const viewResult = $("view-result") as HTMLElement;
 const elUserId = $("userId") as HTMLInputElement;
 const elPrompt = $("prompt") as HTMLElement;
 const elTyping = $("typing") as HTMLTextAreaElement;
@@ -163,7 +185,17 @@ const elJsonPreview = $("jsonPreview") as HTMLElement;
 const btnStart = $("btnStart") as HTMLButtonElement;
 const btnBack = $("btnBack") as HTMLButtonElement;
 const btnReset = $("btnReset") as HTMLButtonElement;
+const btnResultBack = $("btnResultBack") as HTMLButtonElement;
 const deviceBtns = viewSetup.querySelectorAll<HTMLButtonElement>(".device-btn");
+const modeTabs = viewSetup.querySelectorAll<HTMLButtonElement>(".mode-tab");
+const progressField = $("progressField") as HTMLElement;
+const typingHint = $("typingHint") as HTMLElement;
+const typingTitle = $("typingTitle") as HTMLElement;
+const elResultBadge = $("resultBadge") as HTMLElement;
+const elResultMessage = $("resultMessage") as HTMLElement;
+const elResultDetails = $("resultDetails") as HTMLElement;
+
+// ─── UI ────────────────────────────────────────────────────────────────────────
 
 function applyDeviceUi(): void {
   elTyping.style.fontSize = devicePreset === "mobile" ? "16px" : "1rem";
@@ -177,11 +209,19 @@ function setDevicePreset(p: DevicePreset): void {
   applyDeviceUi();
 }
 
+function setMode(m: AppMode): void {
+  appMode = m;
+  modeTabs.forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.mode === m);
+    tab.setAttribute("aria-selected", String(tab.dataset.mode === m));
+  });
+  btnStart.textContent = m === "enroll" ? "Начать регистрацию" : "Начать верификацию";
+}
+
 function setSetupLocked(locked: boolean): void {
   elUserId.disabled = locked;
-  deviceBtns.forEach((b) => {
-    b.disabled = locked;
-  });
+  deviceBtns.forEach((b) => { b.disabled = locked; });
+  (modeTabs as NodeListOf<HTMLButtonElement>).forEach((t) => { t.disabled = locked; });
   btnStart.disabled = locked;
 }
 
@@ -192,11 +232,34 @@ function setResetVisible(visible: boolean): void {
 function showSetupView(): void {
   viewSetup.hidden = false;
   viewTyping.hidden = true;
+  viewResult.hidden = true;
 }
 
 function showTypingView(): void {
   viewSetup.hidden = true;
   viewTyping.hidden = false;
+  viewResult.hidden = true;
+}
+
+function showResultView(data: {
+  accepted: boolean;
+  score: number;
+  threshold: number;
+  confidence: number;
+  message: string;
+}): void {
+  viewSetup.hidden = true;
+  viewTyping.hidden = true;
+  viewResult.hidden = false;
+
+  elResultBadge.textContent = data.accepted ? "✓ Доступ разрешён" : "✗ Доступ запрещён";
+  elResultBadge.className = `result-badge ${data.accepted ? "accepted" : "rejected"}`;
+  elResultMessage.textContent = data.message;
+  elResultDetails.innerHTML = `
+    <div class="result-row"><span>Уверенность</span><strong>${Math.round(data.confidence * 100)}%</strong></div>
+    <div class="result-row"><span>Оценка</span><strong>${data.score.toFixed(3)}</strong></div>
+    <div class="result-row"><span>Порог</span><strong>${data.threshold.toFixed(3)}</strong></div>
+  `;
 }
 
 function updateProgress(): void {
@@ -208,27 +271,118 @@ function updateProgress(): void {
   } else {
     elProgressHint.textContent = `${n}/${requiredCount}`;
   }
-    
 }
 
-function buildPayload(): EnrollmentPayload {
+// ─── Payload ───────────────────────────────────────────────────────────────────
+
+function toBackendAttempt(rec: AttemptRecord): BackendAttempt {
+  return { attemptId: rec.attemptId, events: rec.events };
+}
+
+function buildEnrollPayload(): EnrollPayload {
   return {
-    userId: elUserId.value.trim() || CONFIG.userIdPlaceholder,
-    devicePreset,
+    login: elUserId.value.trim() || CONFIG.userIdPlaceholder,
+    device_type: devicePreset,
     phrase: targetPhrase,
-    attempts,
+    attempts: attempts.map(toBackendAttempt),
+  };
+}
+
+function buildVerifyPayload(rec: AttemptRecord): VerifyPayload {
+  return {
+    login: elUserId.value.trim() || CONFIG.userIdPlaceholder,
+    device_type: devicePreset,
+    phrase: targetPhrase,
+    attempt: toBackendAttempt(rec),
   };
 }
 
 function refreshPreview(): void {
-  elJsonPreview.textContent = JSON.stringify(buildPayload(), null, 2);
+  if (appMode === "enroll") {
+    elJsonPreview.textContent = JSON.stringify(buildEnrollPayload(), null, 2);
+  } else if (attempts.length > 0) {
+    elJsonPreview.textContent = JSON.stringify(buildVerifyPayload(attempts[0]), null, 2);
+  }
 }
 
-function typingSpeedCpm(charCount: number, startedAt: number, endedAt: number): number {
-  const dur = endedAt - startedAt;
-  if (dur <= 0) return 0;
-  return Math.round((charCount * 60000) / dur);
+// ─── API ───────────────────────────────────────────────────────────────────────
+
+function apiUrl(path: string): string | null {
+  const base = CONFIG.apiBaseUrl.trim().replace(/\/$/, "");
+  if (!base) return null;
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${p}`;
 }
+
+async function trySendEnroll(): Promise<void> {
+  const url = apiUrl(CONFIG.enrollmentPath);
+  if (!url) return;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildEnrollPayload()),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({})) as { detail?: string };
+      elStatusSetup.textContent = `Ошибка ${res.status}: ${err.detail ?? "неизвестная ошибка"}`;
+      elStatusSetup.className = "status err";
+      return;
+    }
+    const data = await res.json() as { message: string; attempts_count: number };
+    elStatusSetup.textContent = `${data.message} (попыток: ${data.attempts_count})`;
+    elStatusSetup.className = "status ok";
+  } catch {
+    elStatusSetup.textContent = "Не удалось отправить (сеть или CORS). Смотрите JSON ниже.";
+    elStatusSetup.className = "status err";
+  }
+}
+
+async function trySendVerify(rec: AttemptRecord): Promise<void> {
+  const url = apiUrl(CONFIG.verifyPath);
+  if (!url) {
+    elStatus.textContent = "apiBaseUrl не задан — верификация недоступна.";
+    elStatus.className = "status err";
+    setTimeout(showSetupView, 2500);
+    return;
+  }
+  elStatus.textContent = "Отправляю на сервер…";
+  elStatus.className = "status";
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildVerifyPayload(rec)),
+    });
+    if (res.status === 404) {
+      elStatus.textContent = "Пользователь не найден. Сначала пройдите регистрацию.";
+      elStatus.className = "status err";
+      setTimeout(showSetupView, 2500);
+      return;
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({})) as { detail?: string };
+      elStatus.textContent = `Ошибка ${res.status}: ${err.detail ?? "неизвестная ошибка"}`;
+      elStatus.className = "status err";
+      setTimeout(showSetupView, 2500);
+      return;
+    }
+    const data = await res.json() as {
+      accepted: boolean;
+      score: number;
+      threshold: number;
+      confidence: number;
+      message: string;
+    };
+    showResultView(data);
+  } catch {
+    elStatus.textContent = "Не удалось отправить (сеть или CORS).";
+    elStatus.className = "status err";
+    setTimeout(showSetupView, 2500);
+  }
+}
+
+// ─── Flow ──────────────────────────────────────────────────────────────────────
 
 function beginEnrollment(): void {
   const uid = elUserId.value.trim();
@@ -253,6 +407,10 @@ function beginEnrollment(): void {
   elStatus.className = "status";
   setSetupLocked(true);
   setResetVisible(true);
+  progressField.hidden = false;
+  typingTitle.textContent = "Набор фразы — Регистрация";
+  typingHint.textContent =
+    "Наберите контрольную фразу необходимое количество раз. Набирайте естественно, не копируя. Следующая попытка автоматически переключится при полном совпадении.";
   updateProgress();
   refreshPreview();
   applyDeviceUi();
@@ -260,7 +418,40 @@ function beginEnrollment(): void {
   elTyping.focus();
 }
 
-/** Вернуться на экран имени и режима; текущая регистрация отменяется. */
+function beginVerify(): void {
+  const uid = elUserId.value.trim();
+  if (!uid) {
+    elStatusSetup.textContent = "Введите имя или логин.";
+    elStatusSetup.className = "status err";
+    return;
+  }
+  elStatusSetup.textContent = "";
+  elStatusSetup.className = "status";
+
+  targetPhrase = CONFIG.targetPhrase;
+  requiredCount = 1;
+  attempts = [];
+  sessionActive = true;
+  enrollmentT0 = nowMs();
+  currentCapture = null;
+  elTyping.disabled = false;
+  elTyping.value = "";
+  elPrompt.textContent = targetPhrase;
+  elStatus.textContent = "";
+  elStatus.className = "status";
+  setSetupLocked(true);
+  setResetVisible(false);
+  progressField.hidden = true;
+  typingTitle.textContent = "Набор фразы — Верификация";
+  typingHint.textContent =
+    "Наберите контрольную фразу один раз. Набирайте естественно, не копируя.";
+  updateProgress();
+  refreshPreview();
+  applyDeviceUi();
+  showTypingView();
+  elTyping.focus();
+}
+
 function backToSetup(): void {
   sessionActive = false;
   currentCapture = null;
@@ -279,7 +470,6 @@ function backToSetup(): void {
   elUserId.focus();
 }
 
-/** Очистить попытки и начать набор заново (тот же пользователь и режим). */
 function restartTypingSession(): void {
   if (!sessionActive) return;
   enrollmentT0 = nowMs();
@@ -304,31 +494,10 @@ function ensureCapture(): AttemptCapture | null {
   return currentCapture;
 }
 
-async function trySendToBackend(): Promise<void> {
-  const base = CONFIG.apiBaseUrl.trim().replace(/\/$/, "");
-  if (!base) return;
-  const path = CONFIG.enrollmentPath.startsWith("/")
-    ? CONFIG.enrollmentPath
-    : `/${CONFIG.enrollmentPath}`;
-  const url = `${base}${path}`;
-  const body = JSON.stringify(buildPayload());
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
-    if (!res.ok) {
-      elStatusSetup.textContent = `Сервер ответил ${res.status}. Данные в JSON ниже.`;
-      elStatusSetup.className = "status err";
-      return;
-    }
-    elStatusSetup.textContent = "Отправлено на сервер.";
-    elStatusSetup.className = "status ok";
-  } catch {
-    elStatusSetup.textContent = "Не удалось отправить (сеть или CORS). Смотрите JSON ниже.";
-    elStatusSetup.className = "status err";
-  }
+function typingSpeedCpm(charCount: number, startedAt: number, endedAt: number): number {
+  const dur = endedAt - startedAt;
+  if (dur <= 0) return 0;
+  return Math.round((charCount * 60000) / dur);
 }
 
 function completeAttempt(finalText: string): void {
@@ -349,6 +518,18 @@ function completeAttempt(finalText: string): void {
   };
   attempts.push(rec);
   currentCapture = null;
+
+  if (appMode === "verify") {
+    elTyping.disabled = true;
+    sessionActive = false;
+    setSetupLocked(false);
+    elStatus.textContent = "Проверяю…";
+    elStatus.className = "status";
+    refreshPreview();
+    void trySendVerify(rec);
+    return;
+  }
+
   updateProgress();
   refreshPreview();
 
@@ -359,17 +540,19 @@ function completeAttempt(finalText: string): void {
     setResetVisible(false);
     elStatus.textContent = "";
     elStatus.className = "status";
-    elStatusSetup.textContent = "Готово.";
+    elStatusSetup.textContent = "Готово. Отправляю на сервер…";
     elStatusSetup.className = "status ok";
     updateProgress();
     showSetupView();
-    void trySendToBackend();
+    void trySendEnroll();
     return;
   }
 
   elTyping.value = "";
   elTyping.focus();
 }
+
+// ─── Обработчики событий ───────────────────────────────────────────────────────
 
 function onFocusField(): void {
   const cap = ensureCapture();
@@ -515,9 +698,13 @@ function onCompositionEnd(ev: CompositionEvent): void {
   });
 }
 
+// ─── Wire UI ───────────────────────────────────────────────────────────────────
+
 function wireUi(): void {
   elUserId.placeholder = CONFIG.userIdPlaceholder;
   setDevicePreset(CONFIG.defaultDevicePreset);
+  setMode("enroll");
+
   deviceBtns.forEach((b) => {
     b.addEventListener("click", () => {
       if (b.disabled) return;
@@ -526,9 +713,25 @@ function wireUi(): void {
     });
   });
 
-  btnStart.addEventListener("click", beginEnrollment);
+  modeTabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      if ((tab as HTMLButtonElement).disabled) return;
+      const m = tab.dataset.mode as AppMode;
+      if (m === "enroll" || m === "verify") setMode(m);
+    });
+  });
+
+  btnStart.addEventListener("click", () => {
+    if (appMode === "enroll") beginEnrollment();
+    else beginVerify();
+  });
   btnBack.addEventListener("click", backToSetup);
   btnReset.addEventListener("click", restartTypingSession);
+  btnResultBack.addEventListener("click", () => {
+    showSetupView();
+    setSetupLocked(false);
+    elUserId.focus();
+  });
 
   elTyping.addEventListener("focus", onFocusField);
   elTyping.addEventListener("blur", onBlurField);

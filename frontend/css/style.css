@@ -288,6 +288,106 @@ textarea:disabled {
   color: var(--green-hover);
 }
 
+/* ─── Mode tabs ──────────────────────────────────────────────────────────── */
+
+.mode-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.mode-tab {
+  flex: 1;
+  padding: 0.55rem 0.75rem;
+  border: none;
+  background: #fff;
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-tab + .mode-tab {
+  border-left: 1px solid var(--line);
+}
+
+.mode-tab:hover:not(:disabled) {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.mode-tab.active {
+  background: var(--green);
+  color: #fff;
+  font-weight: 600;
+}
+
+.mode-tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ─── Result view ────────────────────────────────────────────────────────── */
+
+.result-badge {
+  display: block;
+  text-align: center;
+  font-size: 1.35rem;
+  font-weight: 700;
+  padding: 0.9rem 1rem;
+  border-radius: 10px;
+  margin: 0.5rem 0 1rem;
+}
+
+.result-badge.accepted {
+  background: #e8f5e9;
+  color: #1b5e20;
+}
+
+.result-badge.rejected {
+  background: #ffebee;
+  color: #b71c1c;
+}
+
+.result-message {
+  text-align: center;
+  margin: 0 0 1.25rem;
+  font-size: 0.9375rem;
+  color: var(--muted);
+}
+
+.result-details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.result-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.875rem;
+}
+
+.result-row + .result-row {
+  border-top: 1px solid var(--line);
+}
+
+.result-row span {
+  color: var(--muted);
+}
+
+.result-row strong {
+  color: var(--text);
+}
+
+/* ─── Debug ──────────────────────────────────────────────────────────────── */
+
 .debug-wrap {
   max-width: 520px;
   margin: 0 auto;

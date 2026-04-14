@@ -27,6 +27,7 @@ from scipy import stats
 from typing import List, Dict, Any, Optional
 from sklearn.preprocessing import StandardScaler
 
+from app.settings import env_settings
 
 class KeystrokeModel:
     """
@@ -146,7 +147,7 @@ class KeystrokeModel:
         vec     = self._align_vector(feature_dict)
         x_sc    = self.scaler.transform(vec.reshape(1, -1))[0]
         score   = self._mahalanobis(x_sc)
-        accepted = score <= self.threshold
+        accepted = score <= self.threshold and (1.0 - score / (self.threshold + 1e-9))*100 >= env_settings.ThresholdOfConfidence
 
         # confidence: 1.0 at score=0, 0.0 at score=threshold, negative beyond
         conf = round(max(0.0, min(1.0, 1.0 - score / (self.threshold + 1e-9))), 3)

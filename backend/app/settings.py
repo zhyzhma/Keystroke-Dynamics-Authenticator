@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = Field()
     EXTERNAL_DATABASE_PORT: int = Field(le=9999)
 
+    ThresholdOfConfidence: int = Field(ge=0, le=100)
+
     model_config = SettingsConfigDict(env_file=_env_file, env_file_encoding="utf-8")
 
 env_settings: Settings = Settings()

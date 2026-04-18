@@ -32,8 +32,16 @@ class RawEvent(BaseModel):
         extra = "allow"
 
 class KeystrokeAttempt(BaseModel):
-    attemptId: Optional[str] = "unnamed_attempt"
-    events: List[RawEvent]
+    attemptId:  Optional[str]   = "unnamed_attempt"
+    events:     List[RawEvent]
+    # Fields the frontend sends per README2 — kept so engineering.py can use them
+    finalText:  Optional[str]   = None
+    targetText: Optional[str]   = None
+    startedAt:  Optional[float] = None
+    endedAt:    Optional[float] = None
+
+    class Config:
+        extra = "allow"  # forward any other frontend fields without dropping them
 
 class EnrollRequest(BaseModel):
     login: str

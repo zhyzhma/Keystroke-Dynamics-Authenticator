@@ -19,13 +19,17 @@ deviation, and ε is a small floor that prevents division-by-zero when a
 feature is perfectly consistent across all enrollment attempts.
 
 Lower score means the attempt is more similar to the enrolled profile.
-Threshold is set empirically from the enrollment data:
+Threshold is set via Leave-One-Out (LOO) calibration:
 
-    threshold = mean(train_scores) + k * std(train_scores)
+    threshold = mean(loo_scores) + k * std(loo_scores)
 
-where k defaults to 3.0 (3-sigma rule ≈ 99.7 % coverage for a Gaussian).
-In-sample scores are biased downward, so the multiplier provides a safety
-margin equivalent to roughly one standard deviation of generalisation error.
+where k defaults to 2.5 and loo_scores[i] is the score of attempt i
+evaluated against the model trained on all OTHER attempts.  LOO scores
+are unbiased estimates of out-of-sample owner performance, so the
+threshold correctly accounts for genuine variation across sessions.
+
+The sigma floor is set to max(p25(sigma), eps) to prevent near-zero-
+variance features from dominating the Scaled Manhattan sum.
 
 The ThresholdOfConfidence setting (0–100) acts as an additional strictness
 knob: it requires confidence = (1 − score/threshold) × 100 ≥ the setting,
@@ -54,8 +58,8 @@ class KeystrokeModel:
     _enrollment   : ndarray – Raw enrollment matrix (kept for diagnostics).
     """
 
-    _EPS = 1e-6          # sigma floor to avoid division by zero
-    _SIGMA_K = 3.0       # threshold = mean + _SIGMA_K * std of training scores
+    _EPS = 1e-6          # absolute sigma floor to avoid division by zero
+    _SIGMA_K = 2.5       # threshold = mean_loo + _SIGMA_K * std_loo
 
     def __init__(self):
         self.is_trained:    bool                 = False
@@ -101,18 +105,36 @@ class KeystrokeModel:
         # Per-feature statistics
         self._mu    = X.mean(axis=0)
         sigma_raw   = X.std(axis=0, ddof=1)           # sample std
-        self._sigma = np.maximum(sigma_raw, self._EPS)
+        # p25 floor: prevents near-zero-variance features from dominating the sum
+        positive_sigmas = sigma_raw[sigma_raw > 0]
+        sigma_floor = float(np.percentile(positive_sigmas, 25)) if len(positive_sigmas) > 0 else self._EPS
+        self._sigma = np.maximum(sigma_raw, max(sigma_floor, self._EPS))
 
-        # Training Scaled Manhattan distances
-        train_scores = self._batch_score(X)
-
-        t_mean = float(train_scores.mean())
-        t_std  = float(train_scores.std(ddof=1)) if len(train_scores) > 1 else 0.0
+        # LOO threshold: unbiased estimate of out-of-sample owner performance
+        loo_scores = self._compute_loo_scores(X)
+        t_mean = float(loo_scores.mean())
+        t_std  = float(loo_scores.std(ddof=1)) if len(loo_scores) > 1 else 0.0
         self.threshold = t_mean + self._SIGMA_K * t_std
 
         self.is_trained = True
 
     # ------------------------------------------------------------------
+    def _compute_loo_scores(self, X: np.ndarray) -> np.ndarray:
+        """Leave-one-out Scaled Manhattan scores for each enrollment attempt."""
+        n = len(X)
+        scores = np.zeros(n)
+        for i in range(n):
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+            X_tr = X[mask]
+            mu_i = X_tr.mean(axis=0)
+            raw_sig = X_tr.std(axis=0, ddof=1)
+            pos = raw_sig[raw_sig > 0]
+            floor_i = float(np.percentile(pos, 25)) if len(pos) > 0 else self._EPS
+            sig_i = np.maximum(raw_sig, max(floor_i, self._EPS))
+            scores[i] = float(np.mean(np.abs(X[i] - mu_i) / sig_i))
+        return scores
+
     def _score(self, x: np.ndarray) -> float:
         """Scaled Manhattan distance of a single row vector from the enrollment mean."""
         return float(np.mean(np.abs(x - self._mu) / self._sigma))

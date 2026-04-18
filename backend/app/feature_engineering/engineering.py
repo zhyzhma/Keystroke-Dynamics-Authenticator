@@ -2,7 +2,7 @@ import json
 import sys
 import argparse
 from collections import defaultdict
-from statistics import mean, median, pstdev
+from statistics import mean, median, stdev
 from typing import Any, Dict, List, Optional
 
 from app.ml_model.model import KeystrokeModel, extract_training_data
@@ -23,7 +23,7 @@ def safe_mean_std(values: List[float]) -> Dict[str, float]:
     vals = [float(v) for v in values]
     return {
         "mean":   float(mean(vals)),
-        "std":    float(pstdev(vals)),
+        "std":    float(stdev(vals)),
         "min":    float(min(vals)),
         "max":    float(max(vals)),
         "median": float(median(vals)),

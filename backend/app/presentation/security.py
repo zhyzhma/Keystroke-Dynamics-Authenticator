@@ -75,15 +75,22 @@ async def enroll_user(
     raw_data = payload.model_dump(by_alias=True)
     processed_data = transform_payload(raw_data)
     vectors, names = extract_training_data(processed_data)
-    
-    if len(vectors) < 10:
+
+    total = len(payload.attempts)
+    valid = len(vectors)
+
+    if valid < 10:
         raise HTTPException(
             status_code=400,
-            detail="Недостаточно попыток для обучения. Нужно минимум 10 (рекомендуется 30+)."
+            detail=(
+                f"Недостаточно корректных попыток: {valid}/{total}. "
+                "Нужно минимум 10 (рекомендуется 30+). "
+                "Убедитесь, что текст вводится точно без опечаток."
+            ),
         )
 
     model = KeystrokeModel()
-    model.fit(vectors, names)
+    model.fit(vectors, names, phrase=payload.phrase)
 
     # BUG FIX: enroll now uses UserDeviceModel (same table as verify),
     # so the stored model is actually found during verification.
@@ -102,8 +109,8 @@ async def enroll_user(
     await db.commit()
     
     return EnrollResponse(
-        message="Модель успешно обучена и сохранена",
-        attempts_count=len(vectors)
+        message=f"Модель успешно обучена и сохранена ({valid}/{total} попыток корректны)",
+        attempts_count=valid,
     )
 
 
@@ -136,17 +143,27 @@ async def verify_user(
         "attempts": [payload.attempt.model_dump(by_alias=True)]
     }
     processed_data = transform_payload(raw_data)
-    
+
     if not processed_data["attempts"]:
         raise HTTPException(status_code=400, detail="Не удалось обработать данные ввода")
-    
-    current_features = processed_data["attempts"][0]["features"]["flat_features"]
-    prediction = model.predict(current_features)
+
+    attempt_feats = processed_data["attempts"][0]["features"]
+
+    if not attempt_feats.get("valid"):
+        return VerifyResponse(
+            accepted=False,
+            score=0.0,
+            threshold=float(model.threshold or 0.0),
+            confidence=0.0,
+            message="Введённый текст не совпадает с фразой — доступ запрещён",
+        )
+
+    prediction = model.predict(attempt_feats["flat_features"])
 
     return VerifyResponse(
         accepted=prediction["accepted"],
         score=prediction["score"],
         threshold=prediction["threshold"],
         confidence=prediction["confidence"],
-        message="Доступ разрешен" if prediction["accepted"] else "Доступ запрещен: почерк не совпадает"
+        message="Доступ разрешён" if prediction["accepted"] else "Доступ запрещён: почерк не совпадает",
     )

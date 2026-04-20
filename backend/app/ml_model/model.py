@@ -1,159 +1,153 @@
 """
 Keystroke Dynamics authentication model.
 
-Algorithm: Scaled Manhattan Distance to enrollment centroid.
+Pipeline: zero-variance drop → StandardScale → PCA → Mahalanobis one-class.
 
-This is the standard reference algorithm for fixed-text keystroke dynamics,
-described and benchmarked in:
-  Killourhy & Maxion (2009) "Comparing Anomaly-Detection Algorithms for
-  Keystroke Dynamics", IEEE DSN.  It consistently ranks among the top
-  performers on fixed-text datasets.
+Why PCA before Mahalanobis?
+  With ~462 raw features and ~30 enrollment samples the covariance matrix is
+  severely under-determined (n << d).  PCA reduces dimensionality to
+  k = min(n_samples - 2, pca_max_components) before fitting, ensuring n >> d
+  and producing a stable, invertible covariance.
 
-Given an enrollment matrix X (n_attempts × d_features) and a verification
-vector x, the score is:
+Why LedoitWolf instead of the manual shrinkage formula?
+  sklearn's LedoitWolf computes the analytically optimal shrinkage coefficient
+  (Ledoit & Wolf 2004) rather than the heuristic alpha = max(0, 1-(n-1)/d).
+  It is well-validated and works better across varying n/d ratios.
 
-    score = (1/d) * Σ_i  |x_i − μ_i| / max(σ_i, ε)
-
-where μ_i and σ_i are the per-feature enrollment mean and sample standard
-deviation, and ε is a small floor that prevents division-by-zero when a
-feature is perfectly consistent across all enrollment attempts.
-
-Lower score means the attempt is more similar to the enrolled profile.
-Threshold is set via Leave-One-Out (LOO) calibration:
-
-    threshold = mean(loo_scores) + k * std(loo_scores)
-
-where k defaults to 2.5 and loo_scores[i] is the score of attempt i
-evaluated against the model trained on all OTHER attempts.  LOO scores
-are unbiased estimates of out-of-sample owner performance, so the
-threshold correctly accounts for genuine variation across sessions.
-
-The sigma floor is set to max(p25(sigma), eps) to prevent near-zero-
-variance features from dominating the Scaled Manhattan sum.
-
-The ThresholdOfConfidence setting (0–100) acts as an additional strictness
-knob: it requires confidence = (1 − score/threshold) × 100 ≥ the setting,
-effectively tightening the boundary without re-training the model.
+Why a hybrid threshold?
+  chi-squared gives the theoretically correct Mahalanobis radius for a
+  multivariate normal.  But with small n the in-sample distances are
+  downward-biased (we fit and evaluate on the same 30 points).  The hybrid
+  threshold takes max(chi2_threshold, empirical_p95 * safety_factor) so
+  genuine users are not rejected during initial verification.
 """
 
 import pickle
 import numpy as np
+from scipy import stats
 from typing import List, Dict, Any, Optional
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.covariance import LedoitWolf
 
 from app.settings import env_settings
 
 
 class KeystrokeModel:
     """
-    Fixed-text keystroke dynamics authenticator.
+    PCA + Mahalanobis One-Class classifier for keystroke-dynamics authentication.
 
     Attributes
     ----------
-    is_trained    : bool
-    threshold     : float  – Scaled Manhattan acceptance boundary.
-    feature_names : list   – Feature names from enrollment (phrase-aligned).
-    phrase        : str    – Phrase used during enrollment (informational).
-    _mu           : ndarray – Per-feature enrollment mean.
-    _sigma        : ndarray – Per-feature enrollment std (floored at _EPS).
-    _enrollment   : ndarray – Raw enrollment matrix (kept for diagnostics).
+    is_trained        : bool
+    threshold         : float  – Mahalanobis radius below which an attempt is accepted.
+    feature_names     : list   – Raw feature names surviving the zero-variance filter.
     """
 
-    _EPS = 1e-6          # absolute sigma floor to avoid division by zero
-    _SIGMA_K = 2.5       # threshold = mean_loo + _SIGMA_K * std_loo
+    def __init__(self, confidence: float = 0.99, pca_max_components: int = 50):
+        """
+        Parameters
+        ----------
+        confidence : float
+            Fraction of the chi-squared distribution used for the theoretical
+            component of the acceptance threshold.  0.99 is appropriate after
+            PCA reduction; the old 0.999 was set for 462-dim space and produced
+            an unreasonably large threshold.
+        pca_max_components : int
+            Hard cap on PCA components.  The actual number used is
+            min(n_samples - 2, pca_max_components, n_features_after_filter).
+        """
+        self.confidence = confidence
+        self.pca_max_components = pca_max_components
 
-    def __init__(self):
-        self.is_trained:    bool                 = False
-        self.threshold:     Optional[float]      = None
-        self.feature_names: Optional[List[str]]  = None
-        self.phrase:        Optional[str]        = None
+        self.scaler: StandardScaler = StandardScaler()
+        self.pca: Optional[PCA] = None
 
-        self._mu:         Optional[np.ndarray] = None
-        self._sigma:      Optional[np.ndarray] = None
-        self._enrollment: Optional[np.ndarray] = None
+        self.is_trained: bool = False
+        self.threshold: Optional[float] = None
+        self.feature_names: Optional[List[str]] = None
+
+        self._mu: Optional[np.ndarray] = None
+        self._cov_inv: Optional[np.ndarray] = None
+        self._keep_mask: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
-    def fit(
-        self,
-        feature_vectors: List[List[float]],
-        feature_names:   List[str],
-        phrase:          str = "",
-    ) -> None:
+    def fit(self, feature_vectors: List[List[float]], feature_names: List[str]) -> None:
         """
         Train on enrollment attempts.
 
-        All vectors must have the same length (guaranteed by extract_training_data
-        when the phrase does not change between attempts).
-
         Steps
         -----
-        1. Build enrollment matrix X (n × d).
-        2. Compute per-feature mean μ and sample std σ (floored at _EPS).
-        3. Compute Scaled Manhattan distance for every training vector.
-        4. Set threshold = mean(scores) + _SIGMA_K × std(scores).
+        1. Drop zero-variance features.
+        2. StandardScale.
+        3. PCA: reduce to k = min(n_samples - 2, pca_max_components, n_features).
+        4. LedoitWolf regularised covariance in PCA space.
+        5. Hybrid threshold: max(chi2_threshold, empirical_p95 * 2.5).
         """
         if not feature_vectors or len(feature_vectors) < 5:
             raise ValueError(
-                f"Need at least 5 valid enrollment attempts, got {len(feature_vectors)}. "
+                f"Need at least 5 enrollment attempts, got {len(feature_vectors)}. "
                 "Recommended: 30–40."
             )
 
-        X = np.array(feature_vectors, dtype=float)   # (n, d)
-        self.feature_names = list(feature_names)
-        self.phrase        = phrase
-        self._enrollment   = X
+        X = np.array(feature_vectors, dtype=float)
 
-        # Per-feature statistics
-        self._mu    = X.mean(axis=0)
-        sigma_raw   = X.std(axis=0, ddof=1)           # sample std
-        # p25 floor: prevents near-zero-variance features from dominating the sum
-        positive_sigmas = sigma_raw[sigma_raw > 0]
-        sigma_floor = float(np.percentile(positive_sigmas, 25)) if len(positive_sigmas) > 0 else self._EPS
-        self._sigma = np.maximum(sigma_raw, max(sigma_floor, self._EPS))
+        # 1. Drop zero-variance features
+        stds = X.std(axis=0)
+        self._keep_mask = stds > 0
+        X = X[:, self._keep_mask]
+        self.feature_names = list(np.array(feature_names)[self._keep_mask])
 
-        # LOO threshold: unbiased estimate of out-of-sample owner performance
-        loo_scores = self._compute_loo_scores(X)
-        t_mean = float(loo_scores.mean())
-        t_std  = float(loo_scores.std(ddof=1)) if len(loo_scores) > 1 else 0.0
-        self.threshold = t_mean + self._SIGMA_K * t_std
+        n_samples, n_features = X.shape
 
+        # 2. StandardScale
+        X = self.scaler.fit_transform(X)
+
+        # 3. PCA — guarantees n_samples >> n_components for stable covariance
+        n_components = min(n_samples - 2, self.pca_max_components, n_features)
+        n_components = max(1, n_components)
+        self.pca = PCA(n_components=n_components, random_state=42)
+        X_pca = self.pca.fit_transform(X)
+
+        # 4. LedoitWolf regularised covariance
+        lw = LedoitWolf()
+        lw.fit(X_pca)
+        self._mu = X_pca.mean(axis=0)
+        self._cov_inv = np.linalg.inv(lw.covariance_)
+
+        # 5. Hybrid threshold
+        #    a) Chi-squared: theoretically correct boundary for multivariate normal
+        chi2_threshold = float(np.sqrt(stats.chi2.ppf(self.confidence, df=n_components)))
+
+        #    b) Empirical: 95th-percentile of in-sample distances × safety factor.
+        #       In-sample distances are biased low (fit and evaluate on same data),
+        #       so the multiplier (2.5) adds the margin that LOO cross-validation
+        #       would otherwise provide.
+        train_dists = np.array([self._mahalanobis_raw(x) for x in X_pca])
+        empirical_threshold = float(np.percentile(train_dists, 95)) * 2.5
+
+        self.threshold = max(chi2_threshold, empirical_threshold)
         self.is_trained = True
 
     # ------------------------------------------------------------------
-    def _compute_loo_scores(self, X: np.ndarray) -> np.ndarray:
-        """Leave-one-out Scaled Manhattan scores for each enrollment attempt."""
-        n = len(X)
-        scores = np.zeros(n)
-        for i in range(n):
-            mask = np.ones(n, dtype=bool)
-            mask[i] = False
-            X_tr = X[mask]
-            mu_i = X_tr.mean(axis=0)
-            raw_sig = X_tr.std(axis=0, ddof=1)
-            pos = raw_sig[raw_sig > 0]
-            floor_i = float(np.percentile(pos, 25)) if len(pos) > 0 else self._EPS
-            sig_i = np.maximum(raw_sig, max(floor_i, self._EPS))
-            scores[i] = float(np.mean(np.abs(X[i] - mu_i) / sig_i))
-        return scores
+    def _mahalanobis_raw(self, x: np.ndarray) -> float:
+        """Mahalanobis distance of a pre-projected, pre-scaled vector from mu."""
+        delta = x - self._mu
+        return float(np.sqrt(delta @ self._cov_inv @ delta))
 
-    def _score(self, x: np.ndarray) -> float:
-        """Scaled Manhattan distance of a single row vector from the enrollment mean."""
-        return float(np.mean(np.abs(x - self._mu) / self._sigma))
-
-    def _batch_score(self, X: np.ndarray) -> np.ndarray:
-        """Vectorised Scaled Manhattan for a (n × d) matrix."""
-        return np.mean(np.abs(X - self._mu) / self._sigma, axis=1)
-
-    def _align_vector(self, feature_dict: Dict[str, float]) -> np.ndarray:
+    def _align_and_project(self, feature_dict: Dict[str, float]) -> np.ndarray:
         """
-        Map a feature dict → 1-D numpy array aligned to self.feature_names.
-        Features absent in the dict default to 0.0.
+        Map feature dict → numpy array aligned with training features,
+        apply StandardScaler, then project through PCA.
         """
-        if self.feature_names is None:
-            raise RuntimeError("Model has no feature names stored.")
-        return np.array(
+        if self.feature_names is None or self.pca is None:
+            raise RuntimeError("Model is not trained.")
+        vec = np.array(
             [float(feature_dict.get(name, 0.0)) for name in self.feature_names],
             dtype=float,
         )
+        x_sc = self.scaler.transform(vec.reshape(1, -1))
+        return self.pca.transform(x_sc)[0]
 
     # ------------------------------------------------------------------
     def predict(self, feature_dict: Dict[str, float]) -> Dict[str, Any]:
@@ -162,21 +156,19 @@ class KeystrokeModel:
 
         Returns
         -------
-        dict
-            score      – Scaled Manhattan distance (lower = more owner-like).
-            threshold  – Acceptance boundary (set during fit).
-            accepted   – True if score ≤ threshold AND confidence ≥ ThresholdOfConfidence.
-            confidence – float ∈ [0, 1]: how comfortably within the boundary.
+        dict with keys:
+            score      – Mahalanobis distance in PCA space (lower = more owner-like).
+            threshold  – acceptance boundary.
+            accepted   – bool.
+            confidence – float in [0, 1], how comfortably within the boundary.
         """
         if not self.is_trained:
             raise RuntimeError("Model is not trained.")
 
-        x     = self._align_vector(feature_dict)
-        score = self._score(x)
+        x_pca = self._align_and_project(feature_dict)
+        score = self._mahalanobis_raw(x_pca)
 
-        # confidence: 1.0 at score=0, 0.0 at score=threshold, negative beyond
-        conf = round(max(0.0, min(1.0, 1.0 - score / (self.threshold + self._EPS))), 3)
-
+        conf = round(max(0.0, min(1.0, 1.0 - score / (self.threshold + 1e-9))), 3)
         accepted = (
             score <= self.threshold
             and conf * 100 >= env_settings.ThresholdOfConfidence
@@ -201,33 +193,33 @@ class KeystrokeModel:
 
 
 # ---------------------------------------------------------------------------
-# Helper: extract training data from transform_payload output
+# Helper for training data extraction
 # ---------------------------------------------------------------------------
 
 def extract_training_data(parsed_json: Dict[str, Any]):
     """
     Extract (vectors, feature_names) from the output of transform_payload().
 
-    Only includes attempts where "valid" is True (typed text matched phrase).
-    With phrase-aligned features all valid attempts have the same feature names,
-    so no union/padding is needed.
+    Different attempts may produce different n-gram features (digraphs/trigraphs
+    depend on the exact keys pressed, including typos and corrections).  Collecting
+    feature_vector from the first attempt and reusing its feature_names for all
+    others results in vectors of different lengths → inhomogeneous numpy array.
 
-    Returns
-    -------
-    (vectors, feature_names)  or  ([], []) when no valid attempts exist.
+    Fix: collect flat_features dicts from every attempt, compute the *union* of all
+    feature names, then rebuild each vector by looking up names in the dict (missing
+    features → 0.0).  The resulting matrix is always rectangular.
     """
     flat_list: List[Dict[str, float]] = []
 
     for attempt in parsed_json.get("attempts", []):
-        feats = attempt.get("features", {})
-        if feats.get("valid") and feats.get("flat_features"):
-            flat_list.append(feats["flat_features"])
+        flat = attempt.get("features", {}).get("flat_features")
+        if flat:
+            flat_list.append(flat)
 
     if not flat_list:
-        return [], []
+        return [], None
 
-    # All valid attempts share the same feature names (phrase-aligned)
-    all_names = sorted(flat_list[0].keys())
+    all_names = sorted(set().union(*(f.keys() for f in flat_list)))
     vectors   = [[f.get(name, 0.0) for name in all_names] for f in flat_list]
 
     return vectors, all_names

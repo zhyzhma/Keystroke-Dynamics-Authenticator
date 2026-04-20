@@ -32,16 +32,8 @@ class RawEvent(BaseModel):
         extra = "allow"
 
 class KeystrokeAttempt(BaseModel):
-    attemptId:  Optional[str]   = "unnamed_attempt"
-    events:     List[RawEvent]
-    # Fields the frontend sends per README2 — kept so engineering.py can use them
-    finalText:  Optional[str]   = None
-    targetText: Optional[str]   = None
-    startedAt:  Optional[float] = None
-    endedAt:    Optional[float] = None
-
-    class Config:
-        extra = "allow"  # forward any other frontend fields without dropping them
+    attemptId: Optional[str] = "unnamed_attempt"
+    events: List[RawEvent]
 
 class EnrollRequest(BaseModel):
     login: str
@@ -83,22 +75,15 @@ async def enroll_user(
     raw_data = payload.model_dump(by_alias=True)
     processed_data = transform_payload(raw_data)
     vectors, names = extract_training_data(processed_data)
-
-    total = len(payload.attempts)
-    valid = len(vectors)
-
-    if valid < 10:
+    
+    if len(vectors) < 10:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Недостаточно корректных попыток: {valid}/{total}. "
-                "Нужно минимум 10 (рекомендуется 30+). "
-                "Убедитесь, что текст вводится точно без опечаток."
-            ),
+            detail="Недостаточно попыток для обучения. Нужно минимум 10 (рекомендуется 30+)."
         )
 
     model = KeystrokeModel()
-    model.fit(vectors, names, phrase=payload.phrase)
+    model.fit(vectors, names)
 
     # BUG FIX: enroll now uses UserDeviceModel (same table as verify),
     # so the stored model is actually found during verification.
@@ -117,8 +102,8 @@ async def enroll_user(
     await db.commit()
     
     return EnrollResponse(
-        message=f"Модель успешно обучена и сохранена ({valid}/{total} попыток корректны)",
-        attempts_count=valid,
+        message="Модель успешно обучена и сохранена",
+        attempts_count=len(vectors)
     )
 
 
@@ -151,27 +136,17 @@ async def verify_user(
         "attempts": [payload.attempt.model_dump(by_alias=True)]
     }
     processed_data = transform_payload(raw_data)
-
+    
     if not processed_data["attempts"]:
         raise HTTPException(status_code=400, detail="Не удалось обработать данные ввода")
-
-    attempt_feats = processed_data["attempts"][0]["features"]
-
-    if not attempt_feats.get("valid"):
-        return VerifyResponse(
-            accepted=False,
-            score=0.0,
-            threshold=float(model.threshold or 0.0),
-            confidence=0.0,
-            message="Введённый текст не совпадает с фразой — доступ запрещён",
-        )
-
-    prediction = model.predict(attempt_feats["flat_features"])
+    
+    current_features = processed_data["attempts"][0]["features"]["flat_features"]
+    prediction = model.predict(current_features)
 
     return VerifyResponse(
         accepted=prediction["accepted"],
         score=prediction["score"],
         threshold=prediction["threshold"],
         confidence=prediction["confidence"],
-        message="Доступ разрешён" if prediction["accepted"] else "Доступ запрещён: почерк не совпадает",
+        message="Доступ разрешен" if prediction["accepted"] else "Доступ запрещен: почерк не совпадает"
     )

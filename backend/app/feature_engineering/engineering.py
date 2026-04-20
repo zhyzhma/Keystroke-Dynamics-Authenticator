@@ -94,17 +94,17 @@ class AttemptExtractor:
     Extracts the full set of keystroke-dynamics features required by the spec:
 
     Global timing
-      - dwell (hold) time          – keydown → keyup per key
-      - flight time                – keyup[i] → keydown[i+1]
-      - down-down time             – keydown[i] → keydown[i+1]
-      - up-up time                 – keyup[i]   → keyup[i+1]
+      - dwell (hold) time          - keydown -> keyup per key
+      - flight time                - keyup[i] -> keydown[i+1]
+      - down-down time             - keydown[i] -> keydown[i+1]
+      - up-up time                 - keyup[i]   -> keyup[i+1]
 
     Per-key
       - dwell stats for each physical key code
 
     N-grams (per pair/triple of *printable* characters)
       - digraph : flight, down-down, up-up + frequency count
-      - trigraph: span (keyup[0] → keydown[2]) + frequency count
+      - trigraph: span (keyup[0] -> keydown[2]) + frequency count
 
     Errors
       - backspace count

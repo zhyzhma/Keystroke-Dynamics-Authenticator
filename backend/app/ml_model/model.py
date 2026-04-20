@@ -1,7 +1,7 @@
 """
 Keystroke Dynamics authentication model.
 
-Pipeline: zero-variance drop → StandardScale → PCA → Mahalanobis one-class.
+Pipeline: zero-variance drop -> StandardScale -> PCA -> Mahalanobis one-class.
 
 Why PCA before Mahalanobis?
   With ~462 raw features and ~30 enrollment samples the covariance matrix is
@@ -40,8 +40,8 @@ class KeystrokeModel:
     Attributes
     ----------
     is_trained        : bool
-    threshold         : float  – Mahalanobis radius below which an attempt is accepted.
-    feature_names     : list   – Raw feature names surviving the zero-variance filter.
+    threshold         : float  - Mahalanobis radius below which an attempt is accepted.
+    feature_names     : list   - Raw feature names surviving the zero-variance filter.
     """
 
     def __init__(self, confidence: float = 0.99, pca_max_components: int = 50):
@@ -87,7 +87,7 @@ class KeystrokeModel:
         if not feature_vectors or len(feature_vectors) < 5:
             raise ValueError(
                 f"Need at least 5 enrollment attempts, got {len(feature_vectors)}. "
-                "Recommended: 30–40."
+                "Recommended: 30-40."
             )
 
         X = np.array(feature_vectors, dtype=float)
@@ -137,7 +137,7 @@ class KeystrokeModel:
 
     def _align_and_project(self, feature_dict: Dict[str, float]) -> np.ndarray:
         """
-        Map feature dict → numpy array aligned with training features,
+        Map feature dict -> numpy array aligned with training features,
         apply StandardScaler, then project through PCA.
         """
         if self.feature_names is None or self.pca is None:
@@ -157,10 +157,10 @@ class KeystrokeModel:
         Returns
         -------
         dict with keys:
-            score      – Mahalanobis distance in PCA space (lower = more owner-like).
-            threshold  – acceptance boundary.
-            accepted   – bool.
-            confidence – float in [0, 1], how comfortably within the boundary.
+            score      - Mahalanobis distance in PCA space (lower = more owner-like).
+            threshold  - acceptance boundary.
+            accepted   - bool.
+            confidence - float in [0, 1], how comfortably within the boundary.
         """
         if not self.is_trained:
             raise RuntimeError("Model is not trained.")
@@ -203,11 +203,11 @@ def extract_training_data(parsed_json: Dict[str, Any]):
     Different attempts may produce different n-gram features (digraphs/trigraphs
     depend on the exact keys pressed, including typos and corrections).  Collecting
     feature_vector from the first attempt and reusing its feature_names for all
-    others results in vectors of different lengths → inhomogeneous numpy array.
+    others results in vectors of different lengths -> inhomogeneous numpy array.
 
     Fix: collect flat_features dicts from every attempt, compute the *union* of all
     feature names, then rebuild each vector by looking up names in the dict (missing
-    features → 0.0).  The resulting matrix is always rectangular.
+    features -> 0.0).  The resulting matrix is always rectangular.
     """
     flat_list: List[Dict[str, float]] = []
 

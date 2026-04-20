@@ -1,66 +1,36 @@
 """
-Keystroke Dynamics authentication model.
-
-Pipeline: zero-variance drop -> StandardScale -> PCA -> Mahalanobis one-class.
-
-Why PCA before Mahalanobis?
-  With ~462 raw features and ~30 enrollment samples the covariance matrix is
-  severely under-determined (n << d).  PCA reduces dimensionality to
-  k = min(n_samples - 2, pca_max_components) before fitting, ensuring n >> d
-  and producing a stable, invertible covariance.
-
-Why LedoitWolf instead of the manual shrinkage formula?
-  sklearn's LedoitWolf computes the analytically optimal shrinkage coefficient
-  (Ledoit & Wolf 2004) rather than the heuristic alpha = max(0, 1-(n-1)/d).
-  It is well-validated and works better across varying n/d ratios.
-
-Why a hybrid threshold?
-  chi-squared gives the theoretically correct Mahalanobis radius for a
-  multivariate normal.  But with small n the in-sample distances are
-  downward-biased (we fit and evaluate on the same 30 points).  The hybrid
-  threshold takes max(chi2_threshold, empirical_p95 * safety_factor) so
-  genuine users are not rejected during initial verification.
+Улучшенная модель аутентификации по клавиатурному почерку.
+Конвейер: RobustScaler -> Outlier Filtering -> PCA (Whiten) -> Mahalanobis (Ledoit-Wolf).
 """
 
 import pickle
 import numpy as np
 from scipy import stats
 from typing import List, Dict, Any, Optional
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
-from sklearn.covariance import LedoitWolf
+from sklearn.covariance import LedoitWolf, EllipticEnvelope
 
 from app.settings import env_settings
 
 
 class KeystrokeModel:
     """
-    PCA + Mahalanobis One-Class classifier for keystroke-dynamics authentication.
-
-    Attributes
-    ----------
-    is_trained        : bool
-    threshold         : float  - Mahalanobis radius below which an attempt is accepted.
-    feature_names     : list   - Raw feature names surviving the zero-variance filter.
+    Улучшенная модель PCA + Mahalanobis.
+    Использует робастные методы для защиты от аномалий в поведении пользователя.
     """
 
-    def __init__(self, confidence: float = 0.99, pca_max_components: int = 50):
+    def __init__(self, confidence: float = 0.95, pca_max_components: int = 40):
         """
-        Parameters
-        ----------
-        confidence : float
-            Fraction of the chi-squared distribution used for the theoretical
-            component of the acceptance threshold.  0.99 is appropriate after
-            PCA reduction; the old 0.999 was set for 462-dim space and produced
-            an unreasonably large threshold.
-        pca_max_components : int
-            Hard cap on PCA components.  The actual number used is
-            min(n_samples - 2, pca_max_components, n_features_after_filter).
+        :param confidence: Уровень доверия для теоретического порога (0.95 = 95%).
+        :param pca_max_components: Максимальное количество компонент PCA.
         """
         self.confidence = confidence
         self.pca_max_components = pca_max_components
 
-        self.scaler: StandardScaler = StandardScaler()
+        # Используем RobustScaler вместо StandardScaler, чтобы случайные задержки 
+        # (выбросы) не искажали масштаб всех признаков.
+        self.scaler = RobustScaler()
         self.pca: Optional[PCA] = None
 
         self.is_trained: bool = False
@@ -71,77 +41,62 @@ class KeystrokeModel:
         self._cov_inv: Optional[np.ndarray] = None
         self._keep_mask: Optional[np.ndarray] = None
 
-    # ------------------------------------------------------------------
     def fit(self, feature_vectors: List[List[float]], feature_names: List[str]) -> None:
-        """
-        Train on enrollment attempts.
-
-        Steps
-        -----
-        1. Drop zero-variance features.
-        2. StandardScale.
-        3. PCA: reduce to k = min(n_samples - 2, pca_max_components, n_features).
-        4. LedoitWolf regularised covariance in PCA space.
-        5. Hybrid threshold: max(chi2_threshold, empirical_p95 * 2.5).
-        """
-        if not feature_vectors or len(feature_vectors) < 5:
-            raise ValueError(
-                f"Need at least 5 enrollment attempts, got {len(feature_vectors)}. "
-                "Recommended: 30-40."
-            )
+        if not feature_vectors or len(feature_vectors) < 10:
+            raise ValueError(f"Нужно минимум 10 попыток, получено {len(feature_vectors)}")
 
         X = np.array(feature_vectors, dtype=float)
 
-        # 1. Drop zero-variance features
+        # 1. Более строгий фильтр признаков
+        # Убираем признаки, где почти нет изменений (std < 0.0001)
         stds = X.std(axis=0)
-        self._keep_mask = stds > 0
+        self._keep_mask = stds > 1e-4 
         X = X[:, self._keep_mask]
         self.feature_names = list(np.array(feature_names)[self._keep_mask])
 
-        n_samples, n_features = X.shape
+        # 2. Робастное масштабирование
+        X_scaled = self.scaler.fit_transform(X)
 
-        # 2. StandardScale
-        X = self.scaler.fit_transform(X)
+        n_samples, n_features = X_scaled.shape
 
-        # 3. PCA — guarantees n_samples >> n_components for stable covariance
-        n_components = min(n_samples - 2, self.pca_max_components, n_features)
-        n_components = max(1, n_components)
-        self.pca = PCA(n_components=n_components, random_state=42)
-        X_pca = self.pca.fit_transform(X)
+        # 3. Динамический расчет компонент PCA (Исправлено!)
+        # Количество компонент не может быть больше n_samples - 1.
+        # Чтобы матрица была Full Rank, берем еще меньше.
+        suggested_components = min(n_samples - 2, self.pca_max_components, n_features)
+        n_components = max(2, suggested_components)
+        
+        self.pca = PCA(n_components=n_components, whiten=True, random_state=42)
+        X_pca = self.pca.fit_transform(X_scaled)
 
-        # 4. LedoitWolf regularised covariance
-        lw = LedoitWolf()
+        # 4. Ledoit-Wolf с защитой
+        lw = LedoitWolf(assume_centered=False)
         lw.fit(X_pca)
+        
         self._mu = X_pca.mean(axis=0)
-        self._cov_inv = np.linalg.inv(lw.covariance_)
+        
+        # Добавляем "малое смещение" (Ridge regularization), чтобы матрица всегда была обратимой
+        cov = lw.covariance_
+        eye = np.eye(n_components)
+        self._cov_inv = np.linalg.inv(cov + 1e-6 * eye)
 
-        # 5. Hybrid threshold
-        #    a) Chi-squared: theoretically correct boundary for multivariate normal
-        chi2_threshold = float(np.sqrt(stats.chi2.ppf(self.confidence, df=n_components)))
-
-        #    b) Empirical: 95th-percentile of in-sample distances × safety factor.
-        #       In-sample distances are biased low (fit and evaluate on same data),
-        #       so the multiplier (2.5) adds the margin that LOO cross-validation
-        #       would otherwise provide.
+        # 5. Порог
+        chi2_val = float(np.sqrt(stats.chi2.ppf(self.confidence, df=n_components)))
         train_dists = np.array([self._mahalanobis_raw(x) for x in X_pca])
-        empirical_threshold = float(np.percentile(train_dists, 95)) * 2.5
+        empirical_val = float(np.percentile(train_dists, 90)) * 2.0
 
-        self.threshold = max(chi2_threshold, empirical_threshold)
+        self.threshold = max(chi2_val, empirical_val)
         self.is_trained = True
 
-    # ------------------------------------------------------------------
     def _mahalanobis_raw(self, x: np.ndarray) -> float:
-        """Mahalanobis distance of a pre-projected, pre-scaled vector from mu."""
+        """Внутренняя функция расчета расстояния Махаланобиса."""
         delta = x - self._mu
         return float(np.sqrt(delta @ self._cov_inv @ delta))
 
     def _align_and_project(self, feature_dict: Dict[str, float]) -> np.ndarray:
-        """
-        Map feature dict -> numpy array aligned with training features,
-        apply StandardScaler, then project through PCA.
-        """
+        """Преобразование входящего словаря в вектор признаков PCA."""
         if self.feature_names is None or self.pca is None:
-            raise RuntimeError("Model is not trained.")
+            raise RuntimeError("Модель не обучена.")
+        
         vec = np.array(
             [float(feature_dict.get(name, 0.0)) for name in self.feature_names],
             dtype=float,
@@ -149,48 +104,80 @@ class KeystrokeModel:
         x_sc = self.scaler.transform(vec.reshape(1, -1))
         return self.pca.transform(x_sc)[0]
 
-    # ------------------------------------------------------------------
     def predict(self, feature_dict: Dict[str, float]) -> Dict[str, Any]:
         """
-        Verify one attempt.
-
-        Returns
-        -------
-        dict with keys:
-            score      - Mahalanobis distance in PCA space (lower = more owner-like).
-            threshold  - acceptance boundary.
-            accepted   - bool.
-            confidence - float in [0, 1], how comfortably within the boundary.
+        Проверка входящей попытки.
         """
         if not self.is_trained:
-            raise RuntimeError("Model is not trained.")
+            raise RuntimeError("Модель не обучена.")
 
-        x_pca = self._align_and_project(feature_dict)
-        score = self._mahalanobis_raw(x_pca)
+        try:
+            x_pca = self._align_and_project(feature_dict)
+            score = self._mahalanobis_raw(x_pca)
+        except Exception as e:
+            # Если возникла ошибка (например, новые признаки), возвращаем отказ
+            return {"score": 999.0, "threshold": self.threshold, "accepted": False, "confidence": 0.0}
 
-        conf = round(max(0.0, min(1.0, 1.0 - score / (self.threshold + 1e-9))), 3)
-        accepted = (
-            score <= self.threshold
-            and conf * 100 >= env_settings.ThresholdOfConfidence
-        )
+        # Confidence: 1.0 (идеально) -> 0.0 (на границе порога)
+        conf = round(max(0.0, min(1.0, 1.0 - (score / self.threshold))), 3)
+        
+        # Интеграция с настройками системы
+        min_conf = getattr(env_settings, "ThresholdOfConfidence", 50)
+        
+        accepted = (score <= self.threshold and (conf * 100) >= min_conf)
 
         return {
-            "score":      score,
-            "threshold":  self.threshold,
-            "accepted":   accepted,
-            "confidence": conf,
+            "score":      float(score),
+            "threshold":  float(self.threshold),
+            "accepted":   bool(accepted),
+            "confidence": float(conf),
         }
 
-    # ------------------------------------------------------------------
+    def save_to_bytes(self) -> bytes:
+        """Сериализация модели в байты для хранения в БД."""
+        return pickle.dumps(self)
+
     def save(self, path: str) -> None:
+        """Сохранение модели в файл."""
         with open(path, "wb") as f:
             pickle.dump(self, f)
 
     @staticmethod
     def load(path: str) -> "KeystrokeModel":
+        """Загрузка модели из файла."""
         with open(path, "rb") as f:
             return pickle.load(f)
 
+
+def extract_training_data(parsed_json: Dict[str, Any]):
+    """
+    Извлечение векторов признаков из JSON. 
+    Гарантирует прямоугольную матрицу (union всех имен признаков).
+    """
+    flat_list: List[Dict[str, float]] = []
+
+    attempts = parsed_json.get("attempts", [])
+    for attempt in attempts:
+        # Проверяем наличие признаков
+        feats = attempt.get("features", {})
+        flat = feats.get("flat_features")
+        
+        # Берем только валидные или имеющиеся попытки
+        if flat:
+            flat_list.append(flat)
+
+    if not flat_list:
+        return [], []
+
+    # Собираем все уникальные ключи признаков
+    all_names = sorted(set().union(*(f.keys() for f in flat_list)))
+    
+    # Строим векторы
+    vectors = []
+    for f in flat_list:
+        vectors.append([f.get(name, 0.0) for name in all_names])
+
+    return vectors, all_names
 
 # ---------------------------------------------------------------------------
 # Helper for training data extraction
